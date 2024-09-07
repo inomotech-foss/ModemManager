@@ -31,6 +31,7 @@
 #include "mm-base-modem-at.h"
 #include "mm-shared-quectel.h"
 #include "mm-modem-helpers-quectel.h"
+#include "mm-broadband-bearer-quectel-ecm.h"
 
 #if defined WITH_MBIM
 #include "mm-port-mbim-quectel.h"
@@ -62,6 +63,8 @@ typedef struct {
     GRegex                        *qgpsurc_regex;
     GRegex                        *qlwurc_regex;
     GRegex                        *rdy_regex;
+    GRegex                        *qnetdevstatus_short_regex;
+    GRegex                        *qnetdevstatus_long_regex;
 } Private;
 
 static void
@@ -94,10 +97,15 @@ get_private (MMSharedQuectel *self)
         priv->qlwurc_regex      = g_regex_new ("\\r\\n\\+QLWURC:.*", G_REGEX_RAW | G_REGEX_OPTIMIZE, 0, NULL);
         priv->rdy_regex         = g_regex_new ("\\r\\nRDY", G_REGEX_RAW | G_REGEX_OPTIMIZE, 0, NULL);
 
+        priv->qnetdevstatus_short_regex = g_regex_new ("\\+QNETDEVSTATUS:\\s*(\\d+)\\r\\n", G_REGEX_RAW | G_REGEX_OPTIMIZE, 0, NULL);
+        priv->qnetdevstatus_long_regex  = mm_quectel_new_qnetdevstatus_long_regex ();
+
         g_assert (priv->dtmf_regex);
         g_assert (priv->qgpsurc_regex);
         g_assert (priv->qlwurc_regex);
         g_assert (priv->rdy_regex);
+        g_assert (priv->qnetdevstatus_short_regex);
+        g_assert (priv->qnetdevstatus_long_regex);
 
         g_assert (MM_SHARED_QUECTEL_GET_IFACE (self)->peek_parent_class);
         priv->class_parent = MM_SHARED_QUECTEL_GET_IFACE (self)->peek_parent_class (self);
@@ -149,6 +157,7 @@ mm_shared_quectel_create_wwan_port (MMBaseModem *self,
     return priv->class_parent->create_wwan_port (self, name, ptype);
 }
 #endif
+
 /*****************************************************************************/
 /* RDY unsolicited event handler */
 
@@ -179,6 +188,155 @@ dtmf_handler (MMPortSerialAt   *port,
 
         mm_obj_dbg (self, "received DTMF: %s", dtmf);
         mm_iface_modem_voice_received_dtmf (MM_IFACE_MODEM_VOICE (self), 0, dtmf);
+}
+
+/*****************************************************************************/
+
+typedef struct {
+    guint                    cid;
+    MMBearerIpFamily         ip_family;
+    MMBearerConnectionStatus status;
+} BearerListReportStatusForeachContext;
+
+static gboolean
+ipf_is_v4 (MMBearerIpFamily ipf)
+{
+    return (ipf == MM_BEARER_IP_FAMILY_IPV4 || ipf == MM_BEARER_IP_FAMILY_IPV4V6);
+}
+
+static gboolean
+ipf_is_v6 (MMBearerIpFamily ipf)
+{
+    return (ipf == MM_BEARER_IP_FAMILY_IPV6 || ipf == MM_BEARER_IP_FAMILY_IPV4V6);
+}
+
+static void
+bearer_list_report_status_foreach (MMBaseBearer *bearer,
+                                   BearerListReportStatusForeachContext *ctx)
+{
+    gint             bearer_cid;
+    MMBearerIpFamily bearer_ipf;
+
+    if (!MM_IS_BROADBAND_BEARER_QUECTEL_ECM (bearer))
+        return;
+
+    bearer_cid = mm_bearer_properties_get_profile_id (mm_base_bearer_peek_config (bearer));
+    bearer_ipf = mm_bearer_properties_get_ip_type (mm_base_bearer_peek_config (bearer));
+
+    if ((ctx->cid > 0) && (bearer_cid != MM_3GPP_PROFILE_ID_UNKNOWN) && (ctx->cid != (guint) bearer_cid))
+        return;
+
+    /* If we have IP family info match that too */
+    if ((ctx->ip_family != MM_BEARER_IP_FAMILY_NONE) && (bearer_ipf != MM_BEARER_IP_FAMILY_NONE)) {
+        if (ipf_is_v4 (ctx->ip_family) && !ipf_is_v4 (bearer_ipf))
+            return;
+        if (ipf_is_v6 (ctx->ip_family) && !ipf_is_v6 (bearer_ipf))
+            return;
+    }
+
+    mm_base_bearer_report_connection_status (bearer, ctx->status);
+}
+
+static void
+qnetdevstatus_common_received (MMBroadbandModem *self,
+                               guint             cid,
+                               gboolean          connected,
+                               MMBearerIpFamily  ip_family)
+{
+    g_autoptr(MMBearerList)              list = NULL;
+    BearerListReportStatusForeachContext ctx;
+
+    /* Setup context */
+    ctx.cid = cid;
+    ctx.ip_family = ip_family;
+    ctx.status = connected ? MM_BEARER_CONNECTION_STATUS_CONNECTED : MM_BEARER_CONNECTION_STATUS_DISCONNECTED;
+
+    /* If empty bearer list, nothing else to do */
+    g_object_get (self,
+                  MM_IFACE_MODEM_BEARER_LIST, &list,
+                  NULL);
+    if (list) {
+        mm_bearer_list_foreach (list,
+                                (MMBearerListForeachFunc)bearer_list_report_status_foreach,
+                                &ctx);
+    }
+}
+
+static void
+qnetdevctl_ready (MMBaseModem  *self,
+                  GAsyncResult *res,
+                  MMPortSerialAt *port)
+{
+    const gchar             *response;
+    g_autoptr(GError)        error = NULL;
+    MMQNetdevCtlConnectType  connect_type = MM_QNETDEVCTL_CONNECT_TYPE_DISCONNECTED;
+    guint                    cid = 0;
+    gboolean                 connected = FALSE;
+
+    response = mm_base_modem_at_command_finish (self, res, &error);
+    if (!response) {
+        mm_obj_warn (port,
+                     "failed to receive +QNETDEVCTL response: %s",
+                     error ? error->message : "<unknown>");
+        return;
+    }
+
+    if (!mm_quectel_parse_qnetdevctl_response (response,
+                                               &connect_type,
+                                               &cid,
+                                               &connected,
+                                               &error)) {
+        mm_obj_warn (port,
+                     "failed to parse +QNETDEVCTL response: %s",
+                     error ? error->message : "<unknown>");
+        return;
+    }
+
+    /* +QNETDEVCTL reports status for all IP families of the CID */
+    qnetdevstatus_common_received (MM_BROADBAND_MODEM (self),
+                                   cid,
+                                   connected,
+                                   MM_BEARER_IP_FAMILY_NONE);
+}
+
+/* Short +QNETDEVSTATUS unsolicited event handler */
+static void
+qnetdevstatus_short_handler (MMPortSerialAt *port,
+                             GMatchInfo *match_info,
+                             MMBroadbandModem *self)
+{
+    /* Short form +QNETDEVSTATUS doesn't give enough info about the connection
+     * so we must run +QNETDEVCTL to get it.
+     */
+    mm_base_modem_at_command (MM_BASE_MODEM (self),
+                              "+QNETDEVCTL?",
+                              3,
+                              FALSE,
+                              (GAsyncReadyCallback)qnetdevctl_ready,
+                              port);
+}
+
+/* Long +QNETDEVSTATUS unsolicited event handler */
+static void
+qnetdevstatus_long_handler (MMPortSerialAt *port,
+                            GMatchInfo *match_info,
+                            MMBroadbandModem *self)
+{
+    MMQNetdevStatusCallState state = MM_QNETDEVSTATUS_CALL_STATE_DISCONNECTED;
+    gboolean                 is_ipv4 = FALSE;
+    g_autoptr(GError)        error = NULL;
+
+    if (!mm_quectel_parse_one_qnetdevstatus (match_info, &state, &is_ipv4, &error)) {
+        mm_obj_warn (port,
+                     "failed to parse +QNETDEVSTATUS response: %s",
+                     error ? error->message : "<unknown>");
+        return;
+    }
+
+    qnetdevstatus_common_received (self,
+                                   0,
+                                   state >= MM_QNETDEVSTATUS_CALL_STATE_READY,
+                                   is_ipv4 ? MM_BEARER_IP_FAMILY_IPV4 : MM_BEARER_IP_FAMILY_IPV6);
 }
 
 /*****************************************************************************/
@@ -233,6 +391,22 @@ mm_shared_quectel_setup_ports (MMBroadbandModem *self)
             ports[i],
             priv->dtmf_regex,
             (MMPortSerialAtUnsolicitedMsgFn)dtmf_handler,
+            self,
+            NULL);
+
+        /* Handle short +QNETDEVSTATUS with single argument */
+        mm_port_serial_at_add_unsolicited_msg_handler (
+            ports[i],
+            priv->qnetdevstatus_short_regex,
+            (MMPortSerialAtUnsolicitedMsgFn)qnetdevstatus_short_handler,
+            self,
+            NULL);
+
+        /* Handle long +QNETDEVSTATUS with four arguments */
+        mm_port_serial_at_add_unsolicited_msg_handler (
+            ports[i],
+            priv->qnetdevstatus_long_regex,
+            (MMPortSerialAtUnsolicitedMsgFn)qnetdevstatus_long_handler,
             self,
             NULL);
     }

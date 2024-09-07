@@ -17,12 +17,17 @@
 #include <config.h>
 
 #include "mm-broadband-modem-quectel.h"
+#include "mm-log.h"
+#include "mm-base-modem-at.h"
 #include "mm-iface-modem.h"
 #include "mm-iface-modem-firmware.h"
 #include "mm-iface-modem-location.h"
 #include "mm-iface-modem-time.h"
+#include "mm-broadband-bearer.h"
 #include "mm-shared-quectel.h"
 #include "mm-base-modem-at.h"
+#include "mm-modem-helpers-quectel.h"
+#include "mm-broadband-bearer-quectel-ecm.h"
 
 static void iface_modem_init          (MMIfaceModemInterface         *iface);
 static void iface_modem_firmware_init (MMIfaceModemFirmwareInterface *iface);
@@ -40,6 +45,345 @@ G_DEFINE_TYPE_EXTENDED (MMBroadbandModemQuectel, mm_broadband_modem_quectel, MM_
                         G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_LOCATION, iface_modem_location_init)
                         G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_TIME, iface_modem_time_init)
                         G_IMPLEMENT_INTERFACE (MM_TYPE_SHARED_QUECTEL, shared_quectel_init))
+
+typedef enum {
+    USBNET_UNKNOWN,
+    /* USB net functionality is not supported */
+    USBNET_UNSUPPORTED,
+    /* Start/stop calls with +QNETDEVCTL, get status with +QNETDEVCTL */
+    USBNET_QNETDEVCTL,
+    /* Start/stop calls with $QCRMCALL, get status with +QNETDEVSTATUS */
+    USBNET_QCRMCALL,
+} UsbnetSupport;
+
+struct _MMBroadbandModemQuectelPrivate {
+    UsbnetSupport usbnet_support;
+};
+
+/*****************************************************************************/
+/* Create Bearer (Modem interface) */
+
+typedef struct {
+    guint               step;
+    MMBearerProperties *properties;
+    MMBaseBearer       *bearer;
+} CreateBearerContext;
+
+static void
+create_bearer_context_free (CreateBearerContext *ctx)
+{
+    g_clear_object (&ctx->bearer);
+    g_clear_object (&ctx->properties);
+    g_slice_free (CreateBearerContext, ctx);
+}
+
+static MMBaseBearer *
+modem_create_bearer_finish (MMIfaceModem  *self,
+                            GAsyncResult  *res,
+                            GError       **error)
+{
+    return MM_BASE_BEARER (g_task_propagate_pointer (G_TASK (res), error));
+}
+
+static void create_bearer_step (GTask *task);
+
+static void
+broadband_bearer_quectel_ecm_new_ready (GObject *source,
+                                        GAsyncResult *res,
+                                        GTask *task)
+{
+    CreateBearerContext *ctx;
+    MMBaseBearer        *bearer = NULL;
+    GError              *error = NULL;
+
+    bearer = mm_broadband_bearer_quectel_ecm_new_finish (res, &error);
+    if (!bearer) {
+        g_task_return_error (task, error);
+        g_object_unref (task);
+        return;
+    }
+
+    ctx = g_task_get_task_data (task);
+    ctx->bearer = bearer;
+    ctx->step++;
+    create_bearer_step (task);
+}
+
+static void
+broadband_bearer_new_ready (GObject *source,
+                            GAsyncResult *res,
+                            GTask *task)
+{
+    CreateBearerContext *ctx;
+    MMBaseBearer        *bearer = NULL;
+    GError              *error = NULL;
+
+    bearer = mm_broadband_bearer_new_finish (res, &error);
+    if (!bearer) {
+        g_task_return_error (task, error);
+        g_object_unref (task);
+        return;
+    }
+
+    ctx = g_task_get_task_data (task);
+    ctx->bearer = bearer;
+    ctx->step++;
+    create_bearer_step (task);
+}
+
+static void
+qnetdevstatus_test_ready (MMBaseModem  *_self,
+                          GAsyncResult *res,
+                          GTask        *task)
+{
+    MMBroadbandModemQuectel *self = MM_BROADBAND_MODEM_QUECTEL (_self);
+    CreateBearerContext     *ctx;
+    const gchar             *response;
+    g_autoptr(GError)        error = NULL;
+    g_auto(GStrv)            groups = NULL;
+
+    ctx = g_task_get_task_data (task);
+
+    response = mm_base_modem_at_command_finish (_self, res, &error);
+    if (response)
+        groups = mm_split_string_groups (mm_strip_tag (response, "+QNETDEVSTATUS"));
+    if (g_strv_length (groups) > 0) {
+        mm_obj_dbg (self, "+QNETDEVSTATUS supported");
+        self->priv->usbnet_support = USBNET_QCRMCALL;
+    }
+
+    ctx->step++;
+    create_bearer_step (task);
+}
+
+static void
+qcrmcall_test_ready (MMBaseModem  *_self,
+                     GAsyncResult *res,
+                     GTask        *task)
+{
+    MMBroadbandModemQuectel *self = MM_BROADBAND_MODEM_QUECTEL (_self);
+    CreateBearerContext     *ctx;
+    const gchar             *response;
+    g_autoptr(GError)        error = NULL;
+    g_auto(GStrv)            groups = NULL;
+
+    ctx = g_task_get_task_data (task);
+
+    response = mm_base_modem_at_command_finish (_self, res, &error);
+    if (response) {
+        groups = mm_split_string_groups (mm_strip_tag (response, "$QCRMCALL"));
+        if (g_strv_length (groups) >= 5) {
+            /* We need +QNETDEVSTATUS to read call info when using $QCRMCALL */
+            mm_base_modem_at_command (MM_BASE_MODEM (self),
+                                      "+QNETDEVSTATUS=?",
+                                      3,
+                                      TRUE, /* cached! */
+                                      (GAsyncReadyCallback)qnetdevstatus_test_ready,
+                                      task);
+            return;
+        }
+    }
+
+    ctx->step++;
+    create_bearer_step (task);
+}
+
+static void
+qnetdevctl_test_ready (MMBaseModem  *_self,
+                       GAsyncResult *res,
+                       GTask        *task)
+{
+    MMBroadbandModemQuectel *self = MM_BROADBAND_MODEM_QUECTEL (_self);
+    CreateBearerContext     *ctx;
+    const gchar             *response;
+    g_autoptr(GError)        error = NULL;
+    g_auto(GStrv)            groups = NULL;
+
+    ctx = g_task_get_task_data (task);
+
+    response = mm_base_modem_at_command_finish (_self, res, &error);
+    if (response) {
+        groups = mm_split_string_groups (mm_strip_tag (response, "+QNETDEVCTL"));
+        if (g_strv_length (groups) >= 3) {
+            mm_obj_dbg (self, "+QNETDEVCTL supported");
+            self->priv->usbnet_support = USBNET_QNETDEVCTL;
+        }
+    }
+
+    ctx->step++;
+    create_bearer_step (task);
+}
+
+static void
+qcfg_test_ready (MMBaseModem  *_self,
+                 GAsyncResult *res,
+                 GTask        *task)
+{
+    MMBroadbandModemQuectel *self = MM_BROADBAND_MODEM_QUECTEL (_self);
+    CreateBearerContext     *ctx;
+    g_autoptr(GHashTable)    results = NULL;
+    g_autoptr(GError)        error = NULL;
+    const gchar             *response;
+    gboolean                 success = FALSE;
+
+    ctx = g_task_get_task_data (task);
+
+    response = mm_base_modem_at_command_finish (_self, res, &error);
+    if (!response) {
+        mm_obj_dbg (self, "usbnet unsupported");
+    } else {
+        results = mm_quectel_parse_qcfg_test_response (response, &error);
+        if (!results) {
+            mm_obj_warn (self, "couldn't parse +QCFG test response: %s", error->message);
+        } else if (!mm_quectel_parse_qcfg_usbnet_support (results, &error)) {
+            if (error)
+                mm_obj_warn (self, "failed to parse +QCFG usbnet support: %s", error->message);
+        } else {
+            success = TRUE;
+        }
+    }
+
+    if (!success)
+        self->priv->usbnet_support = USBNET_UNSUPPORTED;
+    ctx->step++;
+    create_bearer_step (task);
+}
+
+typedef enum {
+    CREATE_BEARER_STEP_FIRST,
+    CREATE_BEARER_STEP_CHECK_NET_PORT,
+    CREATE_BEARER_STEP_CHECK_QCFG,
+    CREATE_BEARER_STEP_CHECK_QNETDEVCTL,
+    CREATE_BEARER_STEP_CHECK_QCRMCALL,
+    CREATE_BEARER_STEP_BEARER,
+    CREATE_BEARER_STEP_LAST
+} CreateBearerStep;
+
+static void
+create_bearer_step (GTask *task)
+{
+    MMBroadbandModemQuectel *self;
+    CreateBearerContext     *ctx;
+
+    self = g_task_get_source_object (task);
+    ctx  = g_task_get_task_data (task);
+
+    switch (ctx->step) {
+    case CREATE_BEARER_STEP_FIRST:
+        mm_obj_dbg (self, "creating bearer...");
+        ctx->step++;
+        /* fall-through */
+
+    case CREATE_BEARER_STEP_CHECK_NET_PORT:
+        if (self->priv->usbnet_support == USBNET_UNKNOWN) {
+            mm_obj_msg (self, "create bearer step [1/6]: checking net port");
+            if (!mm_base_modem_peek_best_data_port (MM_BASE_MODEM (self), MM_PORT_TYPE_NET)) {
+                mm_obj_dbg (self, "no data port available");
+                self->priv->usbnet_support = USBNET_UNSUPPORTED;
+                ctx->step = CREATE_BEARER_STEP_BEARER;
+                create_bearer_step (task);
+                return;
+            }
+        }
+        ctx->step++;
+        /* fall-through */
+
+    case CREATE_BEARER_STEP_CHECK_QCFG:
+        if (self->priv->usbnet_support == USBNET_UNKNOWN) {
+            mm_obj_msg (self, "create bearer step [2/6]: checking +QCFG");
+            mm_base_modem_at_command (MM_BASE_MODEM (self),
+                                      "+QCFG=?",
+                                      3,
+                                      TRUE, /* cached! */
+                                      (GAsyncReadyCallback)qcfg_test_ready,
+                                      task);
+            return;
+        }
+        ctx->step++;
+        /* fall-through */
+
+    case CREATE_BEARER_STEP_CHECK_QNETDEVCTL:
+        if (self->priv->usbnet_support == USBNET_UNKNOWN) {
+            mm_obj_msg (self, "create bearer step [3/6]: checking +QNETDEVCTL");
+            mm_base_modem_at_command (MM_BASE_MODEM (self),
+                                      "+QNETDEVCTL=?",
+                                      3,
+                                      TRUE, /* cached! */
+                                      (GAsyncReadyCallback)qnetdevctl_test_ready,
+                                      task);
+            return;
+        }
+        ctx->step++;
+        /* fall-through */
+
+    case CREATE_BEARER_STEP_CHECK_QCRMCALL:
+        if (self->priv->usbnet_support == USBNET_UNKNOWN) {
+            mm_obj_msg (self, "create bearer step [4/6]: checking $QCRMCALL");
+            mm_base_modem_at_command (MM_BASE_MODEM (self),
+                                      "$QCRMCALL=?",
+                                      3,
+                                      TRUE, /* cached! */
+                                      (GAsyncReadyCallback)qcrmcall_test_ready,
+                                      task);
+            return;
+        }
+        ctx->step++;
+        /* fall-through */
+
+    case CREATE_BEARER_STEP_BEARER:
+        mm_obj_msg (self, "create bearer step [5/6]: creating bearer");
+        if (   self->priv->usbnet_support == USBNET_QNETDEVCTL
+            || self->priv->usbnet_support == USBNET_QCRMCALL) {
+            mm_obj_dbg (self, "usbnet supported, creating ECM bearer");
+            mm_broadband_bearer_quectel_ecm_new (self,
+                                                 ctx->properties,
+                                                 (self->priv->usbnet_support == USBNET_QCRMCALL),
+                                                 NULL, /* cancellable */
+                                                 (GAsyncReadyCallback) broadband_bearer_quectel_ecm_new_ready,
+                                                 task);
+        } else {
+            mm_obj_dbg (self, "usbnet not supported, creating PPP bearer");
+            self->priv->usbnet_support = USBNET_UNSUPPORTED;
+            mm_broadband_bearer_new (MM_BROADBAND_MODEM (self),
+                                     ctx->properties,
+                                     NULL, /* cancellable */
+                                     (GAsyncReadyCallback) broadband_bearer_new_ready,
+                                     task);
+        }
+        return;
+
+    case CREATE_BEARER_STEP_LAST:
+        mm_obj_msg (self, "create bearer step [6/6]: finished");
+        g_task_return_pointer (task, g_object_ref (ctx->bearer), g_object_unref);
+        g_object_unref (task);
+        return;
+
+    default:
+        g_assert_not_reached ();
+    }
+}
+
+static void
+modem_create_bearer (MMIfaceModem       *_self,
+                     MMBearerProperties *properties,
+                     GAsyncReadyCallback callback,
+                     gpointer            user_data)
+{
+    MMBroadbandModemQuectel *self = MM_BROADBAND_MODEM_QUECTEL (_self);
+    CreateBearerContext     *ctx;
+    GTask                   *task;
+
+    task = g_task_new (self, NULL, callback, user_data);
+
+    /* Setup context */
+    ctx = g_slice_new0 (CreateBearerContext);
+    ctx->step = CREATE_BEARER_STEP_FIRST;
+    ctx->properties = g_object_ref (properties);
+    g_task_set_task_data (task, ctx, (GDestroyNotify) create_bearer_context_free);
+
+    /* And start it */
+    create_bearer_step (task);
+}
 
 /*****************************************************************************/
 /* Power state loading (Modem interface) */
@@ -172,8 +516,7 @@ mm_broadband_modem_quectel_new (const gchar  *device,
                          MM_BASE_MODEM_PLUGIN, plugin,
                          MM_BASE_MODEM_VENDOR_ID, vendor_id,
                          MM_BASE_MODEM_PRODUCT_ID, product_id,
-                         /* Generic bearer supports TTY only */
-                         MM_BASE_MODEM_DATA_NET_SUPPORTED, FALSE,
+                         MM_BASE_MODEM_DATA_NET_SUPPORTED, TRUE,
                          MM_BASE_MODEM_DATA_TTY_SUPPORTED, TRUE,
                          MM_IFACE_MODEM_SIM_HOT_SWAP_SUPPORTED, TRUE,
                          NULL);
@@ -182,6 +525,11 @@ mm_broadband_modem_quectel_new (const gchar  *device,
 static void
 mm_broadband_modem_quectel_init (MMBroadbandModemQuectel *self)
 {
+    self->priv = G_TYPE_INSTANCE_GET_PRIVATE (self,
+                                              MM_TYPE_BROADBAND_MODEM_QUECTEL,
+                                              MMBroadbandModemQuectelPrivate);
+
+    self->priv->usbnet_support = USBNET_UNKNOWN;
 }
 
 static void
@@ -189,6 +537,8 @@ iface_modem_init (MMIfaceModemInterface *iface)
 {
     iface_modem_parent = g_type_interface_peek_parent (iface);
 
+    iface->create_bearer = modem_create_bearer;
+    iface->create_bearer_finish = modem_create_bearer_finish;
     iface->setup_sim_hot_swap = mm_shared_quectel_setup_sim_hot_swap;
     iface->setup_sim_hot_swap_finish = mm_shared_quectel_setup_sim_hot_swap_finish;
     iface->cleanup_sim_hot_swap = mm_shared_quectel_cleanup_sim_hot_swap;
@@ -270,6 +620,9 @@ static void
 mm_broadband_modem_quectel_class_init (MMBroadbandModemQuectelClass *klass)
 {
     MMBroadbandModemClass *broadband_modem_class = MM_BROADBAND_MODEM_CLASS (klass);
+
+    g_type_class_add_private (G_OBJECT_CLASS (klass),
+                              sizeof (MMBroadbandModemQuectelPrivate));
 
     broadband_modem_class->setup_ports = mm_shared_quectel_setup_ports;
 }
