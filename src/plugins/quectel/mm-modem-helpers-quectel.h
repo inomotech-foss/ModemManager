@@ -40,4 +40,58 @@ gboolean mm_quectel_is_profile_manager_supported (const gchar *revision,
                                                   guint        release,
                                                   guint        minor);
 
+GHashTable *mm_quectel_parse_qcfg_test_response (const gchar  *response,
+                                                 GError      **error);
+
+gboolean mm_quectel_parse_qcfg_usbnet_support (GHashTable *results,
+                                               GError **error);
+
+GRegex *mm_quectel_new_qnetdevstatus_long_regex (void);
+
+/**
+ * MMQNetdevStatusCallState:
+ * @MM_QNETDEVSTATUS_CALL_STATE_DISCONNECTED: call is not active.
+ * @MM_QNETDEVSTATUS_CALL_STATE_READY: call is active and modem is waiting for host to perform DHCP/RA.
+ * @MM_QNETDEVSTATUS_CALL_STATE_CONNECTED: call is active and host has performed IP addressing.
+ *
+ * Values describing the usbnet call state.
+ */
+typedef enum {
+    MM_QNETDEVSTATUS_CALL_STATE_DISCONNECTED = 0,
+    MM_QNETDEVSTATUS_CALL_STATE_READY        = 1,
+    MM_QNETDEVSTATUS_CALL_STATE_CONNECTED    = 2,
+} MMQNetdevStatusCallState;
+
+gboolean mm_quectel_parse_one_qnetdevstatus (GMatchInfo               *match_info,
+                                             MMQNetdevStatusCallState *call_state,
+                                             gboolean                 *is_ipv4,
+                                             GError                   **error);
+
+gboolean mm_quectel_parse_qnetdevstatus_response (const char                *response,
+                                                  MMQNetdevStatusCallState  *v4_state,
+                                                  MMQNetdevStatusCallState  *v6_state,
+                                                  GError                   **error);
+
+/**
+ * MMQNetdevCtlConnectType:
+ * @MM_QNETDEVCTL_CONNECT_TYPE_DISCONNECTED: not connected/do not connect.
+ * @MM_QNETDEVCTL_CONNECT_TYPE_CONNECT_ONCE: connect to the network once.
+ * @MM_QNETDEVCTL_CONNECT_TYPE_UNUSED: placeholder for invalid/unused value.
+ * @MM_QNETDEVCTL_CONNECT_TYPE_CONNECT_AUTO: connect to the network automatically.
+ *
+ * Values describing the usbnet connect type.
+ */
+typedef enum {
+    MM_QNETDEVCTL_CONNECT_TYPE_DISCONNECTED = 0,
+    MM_QNETDEVCTL_CONNECT_TYPE_CONNECT_ONCE = 1,
+    MM_QNETDEVCTL_CONNECT_TYPE_UNUSED       = 2,
+    MM_QNETDEVCTL_CONNECT_TYPE_CONNECT_AUTO = 3,
+} MMQNetdevCtlConnectType;
+
+gboolean mm_quectel_parse_qnetdevctl_response (const char               *response,
+                                               MMQNetdevCtlConnectType  *connect_type,
+                                               guint                    *cid,
+                                               gboolean                 *connected,
+                                               GError                  **error);
+
 #endif  /* MM_MODEM_HELPERS_QUECTEL_H */

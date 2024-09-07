@@ -301,6 +301,7 @@ if plugins_shared['quectel']
 
   sources = files(
     'quectel/mm-broadband-modem-quectel.c',
+    'quectel/mm-broadband-bearer-quectel-ecm.c',
     'quectel/mm-shared-quectel.c',
     'quectel/mm-shared.c',
   )
