@@ -28,6 +28,17 @@ ATTRS{idVendor}=="2c7c", ATTRS{idProduct}=="0191", ENV{.MM_USBIFNUM}=="01", SUBS
 ATTRS{idVendor}=="2c7c", ATTRS{idProduct}=="0191", ENV{.MM_USBIFNUM}=="02", SUBSYSTEM=="tty", ENV{ID_MM_PORT_TYPE_AT_PRIMARY}="1"
 ATTRS{idVendor}=="2c7c", ATTRS{idProduct}=="0191", ENV{.MM_USBIFNUM}=="03", SUBSYSTEM=="tty", ENV{ID_MM_PORT_TYPE_AT_SECONDARY}="1"
 
+# Quectel EG915N
+#  Note : #0 and #1 are used by the ECM interface
+#  ttyUSB0 (if #2): QCDM/DIAG port
+#  ttyUSB1 (if #3): AT primary port
+#  ttyUSB2 (if #4): AT secondary port
+#  ttyUSB3 (if #6): GPS data port
+ATTRS{idVendor}=="2c7c", ATTRS{idProduct}=="6002", ENV{.MM_USBIFNUM}=="02", SUBSYSTEM=="tty", ENV{ID_MM_PORT_TYPE_QCDM}="1"
+ATTRS{idVendor}=="2c7c", ATTRS{idProduct}=="6002", ENV{.MM_USBIFNUM}=="03", SUBSYSTEM=="tty", ENV{ID_MM_PORT_TYPE_AT_PRIMARY}="1"
+ATTRS{idVendor}=="2c7c", ATTRS{idProduct}=="6002", ENV{.MM_USBIFNUM}=="04", SUBSYSTEM=="tty", ENV{ID_MM_PORT_TYPE_AT_SECONDARY}="1"
+ATTRS{idVendor}=="2c7c", ATTRS{idProduct}=="6002", ENV{.MM_USBIFNUM}=="06", SUBSYSTEM=="tty", ENV{ID_MM_PORT_TYPE_GPS}="1"
+
 # Quectel EG95
 #  ttyUSB0 (if #0): QCDM/DIAG port
 #  ttyUSB1 (if #1): GPS data port
