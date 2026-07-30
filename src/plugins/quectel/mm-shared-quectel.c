@@ -997,7 +997,7 @@ mm_shared_quectel_location_load_capabilities (MMIfaceModemLocation *_self,
 static const MMBaseModemAtCommand gps_startup[] = {
     { "+QGPSCFG=\"outport\",\"usbnmea\"", 3, FALSE, mm_base_modem_response_processor_no_result_continue },
     { "+QGPS=1",                          3, FALSE, mm_base_modem_response_processor_no_result_continue },
-    { "+QGPSXTRA=1",                      3, FALSE, mm_base_modem_response_processor_no_result_continue },
+    { "+QGPSXTRA=1",                      3, FALSE, mm_base_modem_response_processor_continue_on_error },
     { NULL }
 };
 
