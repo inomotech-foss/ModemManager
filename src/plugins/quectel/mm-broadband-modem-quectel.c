@@ -19,6 +19,7 @@
 #include "mm-broadband-modem-quectel.h"
 #include "mm-log.h"
 #include "mm-base-modem-at.h"
+#include "mm-port-serial-at.h"
 #include "mm-iface-modem.h"
 #include "mm-iface-modem-firmware.h"
 #include "mm-iface-modem-location.h"
@@ -56,8 +57,15 @@ typedef enum {
     USBNET_QCRMCALL,
 } UsbnetSupport;
 
+typedef enum {
+    QSCLK_SUPPORT_UNKNOWN,
+    QSCLK_SUPPORT_UNSUPPORTED,
+    QSCLK_SUPPORT_SUPPORTED,
+} QsclkSupport;
+
 struct _MMBroadbandModemQuectelPrivate {
     UsbnetSupport usbnet_support;
+    QsclkSupport  qsclk_support;
 };
 
 /*****************************************************************************/
@@ -500,6 +508,122 @@ modem_power_up (MMIfaceModem        *self,
 }
 
 /*****************************************************************************/
+/* Enabling started (Broadband modem class) */
+
+static gboolean
+enabling_started_finish (MMBroadbandModem  *self,
+                         GAsyncResult      *res,
+                         GError           **error)
+{
+    return g_task_propagate_boolean (G_TASK (res), error);
+}
+
+static void
+qsclk_set_ready (MMBaseModem  *self,
+                 GAsyncResult *res,
+                 GTask        *task)
+{
+    /* Ignore errors */
+    mm_base_modem_at_command_finish (self, res, NULL);
+    g_task_return_boolean (task, TRUE);
+    g_object_unref (task);
+}
+
+static void
+qsclk_test_ready (MMBaseModem  *_self,
+                  GAsyncResult *res,
+                  GTask        *task)
+{
+    MMBroadbandModemQuectel *self = MM_BROADBAND_MODEM_QUECTEL (_self);
+    MMPortSerialAt          *primary;
+
+    if (!mm_base_modem_at_command_finish (_self, res, NULL)) {
+        mm_obj_dbg (self, "sleep mode configuration (+QSCLK) not supported");
+        self->priv->qsclk_support = QSCLK_SUPPORT_UNSUPPORTED;
+        g_task_return_boolean (task, TRUE);
+        g_object_unref (task);
+        return;
+    }
+
+    mm_obj_dbg (self, "sleep mode configuration (+QSCLK) supported");
+    self->priv->qsclk_support = QSCLK_SUPPORT_SUPPORTED;
+
+    /* Append +QSCLK=1 to the primary port init sequence, so that sleep mode
+     * is re-enabled whenever the port is reopened (e.g. on re-enable or after
+     * hotplug). */
+    primary = mm_base_modem_peek_port_primary (_self);
+    if (primary) {
+        g_auto(GStrv)          init_sequence = NULL;
+        g_autoptr(GPtrArray)   updated = NULL;
+        guint                  i;
+
+        g_object_get (primary,
+                      MM_PORT_SERIAL_AT_INIT_SEQUENCE, &init_sequence,
+                      NULL);
+        updated = g_ptr_array_new ();
+        for (i = 0; init_sequence && init_sequence[i]; i++)
+            g_ptr_array_add (updated, init_sequence[i]);
+        g_ptr_array_add (updated, (gpointer) "+QSCLK=1");
+        g_ptr_array_add (updated, NULL);
+        g_object_set (primary,
+                      MM_PORT_SERIAL_AT_INIT_SEQUENCE, (gchar **) updated->pdata,
+                      NULL);
+    }
+
+    /* The init sequence only runs on port open, and the primary port is
+     * already open at this point, so enable sleep mode explicitly once. */
+    mm_base_modem_at_command (_self,
+                              "+QSCLK=1",
+                              3,
+                              FALSE,
+                              (GAsyncReadyCallback) qsclk_set_ready,
+                              task);
+}
+
+static void
+parent_enabling_started_ready (MMBroadbandModem *_self,
+                               GAsyncResult     *res,
+                               GTask            *task)
+{
+    MMBroadbandModemQuectel *self = MM_BROADBAND_MODEM_QUECTEL (_self);
+    GError                  *error = NULL;
+
+    if (!MM_BROADBAND_MODEM_CLASS (mm_broadband_modem_quectel_parent_class)->enabling_started_finish (_self, res, &error)) {
+        g_task_return_error (task, error);
+        g_object_unref (task);
+        return;
+    }
+
+    /* Probe sleep mode support just once */
+    if (self->priv->qsclk_support != QSCLK_SUPPORT_UNKNOWN) {
+        g_task_return_boolean (task, TRUE);
+        g_object_unref (task);
+        return;
+    }
+
+    mm_base_modem_at_command (MM_BASE_MODEM (self),
+                              "+QSCLK=?",
+                              3,
+                              FALSE,
+                              (GAsyncReadyCallback) qsclk_test_ready,
+                              task);
+}
+
+static void
+enabling_started (MMBroadbandModem    *self,
+                  GAsyncReadyCallback  callback,
+                  gpointer             user_data)
+{
+    GTask *task;
+
+    task = g_task_new (self, NULL, callback, user_data);
+    MM_BROADBAND_MODEM_CLASS (mm_broadband_modem_quectel_parent_class)->enabling_started (
+        self,
+        (GAsyncReadyCallback) parent_enabling_started_ready,
+        task);
+}
+
+/*****************************************************************************/
 
 MMBroadbandModemQuectel *
 mm_broadband_modem_quectel_new (const gchar  *device,
@@ -530,6 +654,7 @@ mm_broadband_modem_quectel_init (MMBroadbandModemQuectel *self)
                                               MMBroadbandModemQuectelPrivate);
 
     self->priv->usbnet_support = USBNET_UNKNOWN;
+    self->priv->qsclk_support = QSCLK_SUPPORT_UNKNOWN;
 }
 
 static void
@@ -625,4 +750,6 @@ mm_broadband_modem_quectel_class_init (MMBroadbandModemQuectelClass *klass)
                               sizeof (MMBroadbandModemQuectelPrivate));
 
     broadband_modem_class->setup_ports = mm_shared_quectel_setup_ports;
+    broadband_modem_class->enabling_started        = enabling_started;
+    broadband_modem_class->enabling_started_finish = enabling_started_finish;
 }
