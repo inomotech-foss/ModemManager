@@ -66,7 +66,10 @@ typedef enum {
 struct _MMBroadbandModemQuectelPrivate {
     UsbnetSupport usbnet_support;
     QsclkSupport  qsclk_support;
+    gboolean      urc_port_checked;
 };
+
+#define URC_PORT_USB_AT "usbat"
 
 /*****************************************************************************/
 /* Create Bearer (Modem interface) */
@@ -581,19 +584,9 @@ qsclk_test_ready (MMBaseModem  *_self,
 }
 
 static void
-parent_enabling_started_ready (MMBroadbandModem *_self,
-                               GAsyncResult     *res,
-                               GTask            *task)
+probe_qsclk (MMBroadbandModemQuectel *self,
+             GTask                   *task)
 {
-    MMBroadbandModemQuectel *self = MM_BROADBAND_MODEM_QUECTEL (_self);
-    GError                  *error = NULL;
-
-    if (!MM_BROADBAND_MODEM_CLASS (mm_broadband_modem_quectel_parent_class)->enabling_started_finish (_self, res, &error)) {
-        g_task_return_error (task, error);
-        g_object_unref (task);
-        return;
-    }
-
     /* Probe sleep mode support just once */
     if (self->priv->qsclk_support != QSCLK_SUPPORT_UNKNOWN) {
         g_task_return_boolean (task, TRUE);
@@ -607,6 +600,91 @@ parent_enabling_started_ready (MMBroadbandModem *_self,
                               FALSE,
                               (GAsyncReadyCallback) qsclk_test_ready,
                               task);
+}
+
+static void
+urc_port_set_ready (MMBaseModem  *self,
+                    GAsyncResult *res,
+                    GTask        *task)
+{
+    g_autoptr(GError) error = NULL;
+
+    if (!mm_base_modem_at_command_finish (self, res, &error))
+        mm_obj_warn (self, "couldn't route URCs to the '" URC_PORT_USB_AT "' port: %s", error->message);
+    else
+        mm_obj_msg (self, "URCs routed to the '" URC_PORT_USB_AT "' port");
+
+    probe_qsclk (MM_BROADBAND_MODEM_QUECTEL (self), task);
+}
+
+static void
+urc_port_query_ready (MMBaseModem  *self,
+                      GAsyncResult *res,
+                      GTask        *task)
+{
+    const gchar       *response;
+    g_autofree gchar  *urc_port = NULL;
+    g_autoptr(GError)  error = NULL;
+
+    response = mm_base_modem_at_command_finish (self, res, &error);
+    if (!response || !mm_quectel_parse_qurccfg_urcport_response (response, &urc_port, &error)) {
+        mm_obj_dbg (self, "couldn't load the URC port: %s", error->message);
+        probe_qsclk (MM_BROADBAND_MODEM_QUECTEL (self), task);
+        return;
+    }
+
+    if (g_strcmp0 (urc_port, URC_PORT_USB_AT) == 0) {
+        mm_obj_dbg (self, "URCs already go to the '" URC_PORT_USB_AT "' port");
+        probe_qsclk (MM_BROADBAND_MODEM_QUECTEL (self), task);
+        return;
+    }
+
+    /* ModemManager reads URCs only on the AT ports it opened. With URCs
+     * on a UART, +QNETDEVSTATUS never arrives and every ECM connection
+     * attempt runs into its timeout. */
+    mm_obj_msg (self, "URCs go to the '%s' port, routing them to '" URC_PORT_USB_AT "'", urc_port);
+    mm_base_modem_at_command (self,
+                              "+QURCCFG=\"urcport\",\"" URC_PORT_USB_AT "\"",
+                              3,
+                              FALSE,
+                              (GAsyncReadyCallback) urc_port_set_ready,
+                              task);
+}
+
+static void
+check_urc_port (MMBroadbandModemQuectel *self,
+                GTask                   *task)
+{
+    /* The modem stores the URC port, so one check per modem object is enough */
+    if (self->priv->urc_port_checked) {
+        probe_qsclk (self, task);
+        return;
+    }
+
+    self->priv->urc_port_checked = TRUE;
+    mm_base_modem_at_command (MM_BASE_MODEM (self),
+                              "+QURCCFG=\"urcport\"",
+                              3,
+                              FALSE,
+                              (GAsyncReadyCallback) urc_port_query_ready,
+                              task);
+}
+
+static void
+parent_enabling_started_ready (MMBroadbandModem *_self,
+                               GAsyncResult     *res,
+                               GTask            *task)
+{
+    MMBroadbandModemQuectel *self = MM_BROADBAND_MODEM_QUECTEL (_self);
+    GError                  *error = NULL;
+
+    if (!MM_BROADBAND_MODEM_CLASS (mm_broadband_modem_quectel_parent_class)->enabling_started_finish (_self, res, &error)) {
+        g_task_return_error (task, error);
+        g_object_unref (task);
+        return;
+    }
+
+    check_urc_port (self, task);
 }
 
 static void
@@ -655,6 +733,7 @@ mm_broadband_modem_quectel_init (MMBroadbandModemQuectel *self)
 
     self->priv->usbnet_support = USBNET_UNKNOWN;
     self->priv->qsclk_support = QSCLK_SUPPORT_UNKNOWN;
+    self->priv->urc_port_checked = FALSE;
 }
 
 static void

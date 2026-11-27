@@ -529,3 +529,38 @@ mm_quectel_parse_qnetdevctl_response (const char                *response,
         *connected = raw_connected ? TRUE : FALSE;
     return TRUE;
 }
+
+/**
+ * mm_quectel_parse_qurccfg_urcport_response:
+ * @response: response to the AT+QURCCFG="urcport" query
+ * @urc_port: on return, the port the modem presents URCs on, e.g. "usbat"
+ * @error: Return location for error or %NULL
+ *
+ * Parses the output of the AT+QURCCFG="urcport" query.
+ *
+ * Returns: %TRUE if parsing succeeded, %FALSE if an error occurred.
+ */
+gboolean
+mm_quectel_parse_qurccfg_urcport_response (const gchar  *response,
+                                           gchar       **urc_port,
+                                           GError      **error)
+{
+    g_autoptr(GRegex)      r = NULL;
+    g_autoptr(GMatchInfo)  match_info = NULL;
+
+    g_return_val_if_fail (response != NULL, FALSE);
+
+    /* Response: +QURCCFG: "urcport","usbat" */
+    r = g_regex_new ("\\+QURCCFG:\\s*\"urcport\",\\s*\"([^\"]+)\"", G_REGEX_RAW | G_REGEX_OPTIMIZE, 0, NULL);
+    g_assert (r);
+
+    if (!g_regex_match (r, response, 0, &match_info)) {
+        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                     "failed to match +QURCCFG urcport response");
+        return FALSE;
+    }
+
+    if (urc_port)
+        *urc_port = g_match_info_fetch (match_info, 1);
+    return TRUE;
+}
