@@ -308,6 +308,47 @@ test_mm_quectel_parse_qnetdevctl_response (void)
 
 /*****************************************************************************/
 
+typedef struct {
+    const gchar *response;
+    const gchar *expected_urc_port; /* NULL when parsing must fail */
+} TestQurccfgUrcport;
+
+static const TestQurccfgUrcport test_qurccfg_urcport[] = {
+    { "+QURCCFG: \"urcport\",\"usbat\"",        "usbat"    },
+    { "+QURCCFG: \"urcport\",\"usbmodem\"\r\n", "usbmodem" },
+    { "+QURCCFG: \"urcport\",\"uart1\"",        "uart1"    },
+    { "+QURCCFG:\"urcport\", \"uart1\"",        "uart1"    },
+    { "+QURCCFG: \"urcport\",usbat",            NULL       },
+    { "+QURCCFG: \"other\",\"usbat\"",          NULL       },
+    { "+QCFG: \"risignaltype\",\"physical\"",   NULL       },
+    { "",                                       NULL       },
+};
+
+static void
+test_mm_quectel_parse_qurccfg_urcport_response (void)
+{
+    guint i;
+
+    for (i = 0; i < G_N_ELEMENTS (test_qurccfg_urcport); i++) {
+        g_autofree gchar  *urc_port = NULL;
+        g_autoptr(GError)  error = NULL;
+        gboolean           success;
+
+        success = mm_quectel_parse_qurccfg_urcport_response (test_qurccfg_urcport[i].response, &urc_port, &error);
+        if (test_qurccfg_urcport[i].expected_urc_port) {
+            g_assert_no_error (error);
+            g_assert_true (success);
+            g_assert_cmpstr (urc_port, ==, test_qurccfg_urcport[i].expected_urc_port);
+        } else {
+            g_assert_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED);
+            g_assert_false (success);
+            g_assert_null (urc_port);
+        }
+    }
+}
+
+/*****************************************************************************/
+
 int main (int argc, char **argv)
 {
     setlocale (LC_ALL, "");
@@ -321,6 +362,7 @@ int main (int argc, char **argv)
     g_test_add_func ("/MM/quectel/parse_qcfg_usbnet", test_qcfg_usbnet);
     g_test_add_func ("/MM/quectel/parse_qnetdevstatus", test_mm_quectel_parse_qnetdevstatus_response);
     g_test_add_func ("/MM/quectel/parse_qnetdevctl", test_mm_quectel_parse_qnetdevctl_response);
+    g_test_add_func ("/MM/quectel/parse_qurccfg_urcport", test_mm_quectel_parse_qurccfg_urcport_response);
 
     return g_test_run ();
 }

@@ -94,4 +94,8 @@ gboolean mm_quectel_parse_qnetdevctl_response (const char               *respons
                                                gboolean                 *connected,
                                                GError                  **error);
 
+gboolean mm_quectel_parse_qurccfg_urcport_response (const gchar  *response,
+                                                    gchar       **urc_port,
+                                                    GError      **error);
+
 #endif  /* MM_MODEM_HELPERS_QUECTEL_H */
